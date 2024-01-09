@@ -54,8 +54,15 @@ class ColmapDataParserConfig(DataParserConfig):
     """Directory or explicit json file path specifying location of data."""
     scale_factor: float = 1.0
     """How much to scale the camera origins by."""
-    downscale_factor: Optional[int] = None
-    """How much to downscale images. If not set, images are chosen such that the max dimension is <1600px."""
+    downscale_factor: Optional[float] = None
+    """How much to downscale images. If not set, images are chosen such that the max dimension is < MAX_AUTO_RESOLUTION."""
+    auto_downscale_behavior: Literal["power2", "exact"] = "power2"
+    """The behavior of auto downscale images when downscale_factor is None:
+    - power2: the legacy behavior where each image downsampled by 2**{n} until 
+    the max dimension is <= MAX_AUTO_RESOLUTION    
+    - exact: the new behavior where each image is downsampled by the exact factor such that
+    the max dimension is == MAX_AUTO_RESOLUTION
+    """
     scene_scale: float = 1.0
     """How much to scale the region of interest by."""
     orientation_method: Literal["pca", "up", "vertical", "none"] = "up"
@@ -450,18 +457,17 @@ class ColmapDataParser(DataParser):
             out["points3D_points2D_xy"] = torch.stack(points3D_image_xy, dim=0)
         return out
 
-    def _downscale_images(self, paths, get_fname, downscale_factor: int, nearest_neighbor: bool = False):
+    @staticmethod
+    def _downscale_images(paths, get_fname, w: int, h: int, nearest_neighbor: bool = False):
         with status(msg="[bold yellow]Downscaling images...", spinner="growVertical"):
-            assert downscale_factor > 1
-            assert isinstance(downscale_factor, int)
             # Using %05d ffmpeg commands appears to be unreliable (skips images).
             for path in paths:
-                nn_flag = "" if not nearest_neighbor else ":flags=neighbor"
+                nn_flag = ":flags=area" if not nearest_neighbor else ":flags=neighbor"
                 path_out = get_fname(path)
                 path_out.parent.mkdir(parents=True, exist_ok=True)
                 ffmpeg_cmd = [
                     f'ffmpeg -y -noautorotate -i "{path}" ',
-                    f"-q:v 2 -vf scale=iw/{downscale_factor}:ih/{downscale_factor}{nn_flag} ",
+                    f"-q:v 2 -vf scale={w}:{h}{nn_flag},setsar=1 ",
                     f'"{path_out}"',
                 ]
                 ffmpeg_cmd = " ".join(ffmpeg_cmd)
@@ -483,19 +489,26 @@ class ColmapDataParser(DataParser):
             return base_part / rel_part
 
         filepath = next(iter(image_filenames))
+        test_img = Image.open(filepath)
+        w, h = test_img.size
         if self._downscale_factor is None:
             if self.config.downscale_factor is None:
-                test_img = Image.open(filepath)
-                h, w = test_img.size
-                max_res = max(h, w)
-                df = 0
-                while True:
-                    if (max_res / 2 ** (df)) < MAX_AUTO_RESOLUTION:
-                        break
-                    df += 1
-
-                self._downscale_factor = 2**df
-                CONSOLE.log(f"Using image downscale factor of {self._downscale_factor}")
+                max_res = max(w, h)
+                if self.config.auto_downscale_behavior == "power2":
+                    df = 0
+                    while True:
+                        if (max_res / 2 ** (df)) < MAX_AUTO_RESOLUTION:
+                            break
+                        df += 1
+                    self._downscale_factor = 2**df
+                elif self.config.auto_downscale_behavior == "exact":
+                    self._downscale_factor = max(1, max_res / MAX_AUTO_RESOLUTION)
+                else:
+                    raise NotImplementedError(
+                        f"auto_downscale_behavior={self.config.auto_downscale_behavior} is not implemented."
+                    )
+                if self._downscale_factor > 1:
+                    CONSOLE.log(f"Using image downscale factor of {self._downscale_factor}")
             else:
                 self._downscale_factor = self.config.downscale_factor
             if self._downscale_factor > 1 and not all(
@@ -507,11 +520,14 @@ class ColmapDataParser(DataParser):
                     f"[bold red]Downscaled images do not exist for factor of {self._downscale_factor}.[/bold red]"
                 )
                 if Confirm.ask("\nWould you like to downscale the images now?", default=False, console=CONSOLE):
+                    w_new, h_new = Cameras.scaled_size(
+                        torch.tensor(w), torch.tensor(h), 1.0 / self._downscale_factor)
+                    w_new, h_new = w_new.item(), h_new.item()
                     # Install the method
                     self._downscale_images(
                         image_filenames,
                         partial(get_fname, self.config.data / self.config.images_path),
-                        self._downscale_factor,
+                        w_new, h_new,
                         nearest_neighbor=False,
                     )
                     if len(mask_filenames) > 0:
@@ -519,7 +535,7 @@ class ColmapDataParser(DataParser):
                         self._downscale_images(
                             mask_filenames,
                             partial(get_fname, self.config.data / self.config.masks_path),
-                            self._downscale_factor,
+                            w_new, h_new,
                             nearest_neighbor=True,
                         )
                     if len(depth_filenames) > 0:
@@ -527,7 +543,7 @@ class ColmapDataParser(DataParser):
                         self._downscale_images(
                             depth_filenames,
                             partial(get_fname, self.config.data / self.config.depths_path),
-                            self._downscale_factor,
+                            w_new, h_new,
                             nearest_neighbor=True,
                         )
                 else:
@@ -542,5 +558,4 @@ class ColmapDataParser(DataParser):
             if len(depth_filenames) > 0:
                 assert self.config.depths_path is not None
                 depth_filenames = [get_fname(self.config.data / self.config.depths_path, fp) for fp in depth_filenames]
-        assert isinstance(self._downscale_factor, int)
         return image_filenames, mask_filenames, depth_filenames, self._downscale_factor

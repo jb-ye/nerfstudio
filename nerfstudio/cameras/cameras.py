@@ -980,6 +980,15 @@ class Cameras(TensorDataclass):
         K[..., 2, 2] = 1.0
         return K
 
+    @staticmethod
+    def scaled_size(w: torch.Tensor, h: torch.Tensor, scaling_factor: float):
+        """When scaling factor is an arbitrary float number, the behavior across different
+        libraries/software may not be consistent. To ensure the deterministic behavior, one needs to call
+        Cameras.scaled_size to obtain the same rescaled width and height."""
+        new_w = (w * scaling_factor).to(torch.int64)
+        new_h = (h * scaling_factor).to(torch.int64)
+        return new_w, new_h
+
     def rescale_output_resolution(
         self, scaling_factor: Union[Shaped[Tensor, "*num_cameras"], Shaped[Tensor, "*num_cameras 1"], float, int]
     ) -> None:
@@ -1003,5 +1012,4 @@ class Cameras(TensorDataclass):
         self.fy = self.fy * scaling_factor
         self.cx = self.cx * scaling_factor
         self.cy = self.cy * scaling_factor
-        self.height = (self.height * scaling_factor).to(torch.int64)
-        self.width = (self.width * scaling_factor).to(torch.int64)
+        self.width, self.height = Cameras.scaled_size(self.width, self.height, scaling_factor)
